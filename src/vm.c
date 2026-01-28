@@ -353,7 +353,7 @@ void
 clearaccessbit(pde_t *pgdir)
 { pte_t *pte;
   int count=0;
-  for(long i=4096;i<KERNBASE;i+=PGSIZE){
+  for(uint i=4096;i<KERNBASE;i+=PGSIZE){
       if((pte=walkpgdir(pgdir,(char*)i,0))!= 0){
         cprintf("walkpkgdir mei");
         if((*pte & PTE_P) & (*pte & PTE_A)){
