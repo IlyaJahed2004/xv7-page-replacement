@@ -8,9 +8,16 @@
 #include "elf.h"
 #include "paging.h"
 #include "fs.h"
+#include "spinlock.h"
 
 #include "coremap.h"
 
+#define INV_LOTTERY_C 10000
+
+extern struct {
+  struct spinlock lock;
+  struct proc proc[NPROC];
+} ptable;
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -322,79 +329,60 @@ ii) if (i) is unable to find any such page, randomly reset access bit
     of 10% of the allocated pages and call select_a_victim() again
 */
 
-// Selects a victim page for eviction using the Lottery algorithm.
-// Each physical frame has a number of tickets, and a random draw
-// determines which page will be evicted.
-// Only user pages (PTE_U) are considered.
+// Selects a victim page using the Inverse Lottery replacement policy.
+// Pages with more tickets (hot pages) have a lower chance of eviction.
+// Only present user pages are considered.
 pte_t*
 select_a_victim(pde_t *pgdir)
 {
   pde_t *pde;
   pte_t *pte;
-  pte_t *victim_pte = 0;
 
-  uint total_tickets = 0;   // Total number of lottery tickets
-  uint chosen_ticket = 0;   // Randomly chosen ticket number
-  uint cumulative = 0;      // Cumulative ticket counter
+  uint total_weight = 0;
+  uint chosen;
+  uint cumulative = 0;
 
-  int p; // Page directory index
-
-  // ------------------------------------------------------------
-  // First pass: calculate the total number of tickets
-  // ------------------------------------------------------------
-  for(p = 0; p < NPDENTRIES; p++){
-    pde = &pgdir[p];
-    if(*pde & PTE_P){  // Page directory entry is present
-      pte = (pte_t*)P2V(PTE_ADDR(*pde));
-
-      for(int i = 0; i < NPTENTRIES; i++){
-        // Consider only present user pages
-        if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
-          uint pa = (uint)PTE_ADDR(pte[i]); // Physical address
-          uint idx = pa >> PGSHIFT;          // Frame index
-
-          // Add this frame's tickets to the total
-          if(core_map[idx].tickets > 0)
-            total_tickets += core_map[idx].tickets;
-        }
-      }
-    }
-  }
-
-  // If no tickets are found, no victim can be selected
-  if(total_tickets == 0)
-    return 0;
-
-  // ------------------------------------------------------------
-  // Choose a random ticket number
-  // ------------------------------------------------------------
-  chosen_ticket = ticks % total_tickets;
-
-  // ------------------------------------------------------------
-  // Second pass: find the page whose ticket wins the lottery
-  // ------------------------------------------------------------
-  for(p = 0; p < NPDENTRIES; p++){
+  // -------- First pass: compute total inverse weight --------
+  for(int p = 0; p < NPDENTRIES; p++){
     pde = &pgdir[p];
     if(*pde & PTE_P){
       pte = (pte_t*)P2V(PTE_ADDR(*pde));
 
       for(int i = 0; i < NPTENTRIES; i++){
         if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
-          uint pa = (uint)PTE_ADDR(pte[i]);
+          uint pa = PTE_ADDR(pte[i]);
           uint idx = pa >> PGSHIFT;
 
           if(core_map[idx].tickets > 0){
-            cumulative += core_map[idx].tickets;
+            total_weight += INV_LOTTERY_C / core_map[idx].tickets;
+          }
+        }
+      }
+    }
+  }
 
-            // The ticket falls in this page's range
-            if(cumulative > chosen_ticket){
-              victim_pte = &pte[i];
+  if(total_weight == 0)
+    return 0;
 
-              // Debug output for lottery eviction
-              cprintf("LOTTERY EVICTION: Victim PA 0x%x, tickets %d\n",
-                      pa, core_map[idx].tickets);
+  // -------- Choose random weight --------
+  chosen = ticks % total_weight;
 
-              return victim_pte;
+  // -------- Second pass: find victim --------
+  for(int p = 0; p < NPDENTRIES; p++){
+    pde = &pgdir[p];
+    if(*pde & PTE_P){
+      pte = (pte_t*)P2V(PTE_ADDR(*pde));
+
+      for(int i = 0; i < NPTENTRIES; i++){
+        if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
+          uint pa = PTE_ADDR(pte[i]);
+          uint idx = pa >> PGSHIFT;
+
+          if(core_map[idx].tickets > 0){
+            cumulative += INV_LOTTERY_C / core_map[idx].tickets;
+
+            if(cumulative > chosen){
+              return &pte[i];
             }
           }
         }
@@ -405,6 +393,76 @@ select_a_victim(pde_t *pgdir)
   return 0;
 }
 
+// Select victim page using FIFO replacement
+pte_t*
+select_a_victim_fifo(pde_t *pgdir)
+{
+  pde_t *pde;
+  pte_t *pte;
+  pte_t *victim = 0;
+
+  uint oldest_time = 0xFFFFFFFF;
+
+  for(int p = 0; p < NPDENTRIES; p++){
+    pde = &pgdir[p];
+    if(*pde & PTE_P){
+      pte = (pte_t*)P2V(PTE_ADDR(*pde));
+
+      for(int i = 0; i < NPTENTRIES; i++){
+        if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
+          uint pa = PTE_ADDR(pte[i]);
+          uint idx = pa >> PGSHIFT;
+
+          if(core_map[idx].is_allocated &&
+             core_map[idx].birth_time < oldest_time){
+
+            oldest_time = core_map[idx].birth_time;
+            victim = &pte[i];
+          }
+        }
+      }
+    }
+  }
+
+  return victim;
+}
+
+// Scanner: updates ticket counts based on page access bits (PTE_A)
+// This function is called periodically from the timer interrupt.
+void
+scanner_update_tickets(void)
+{
+  struct proc *p;
+  pte_t *pte;
+  uint va;
+
+  acquire(&ptable.lock);
+
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == UNUSED || p->pgdir == 0)
+      continue;
+
+    // Scan user virtual address space only
+    for(va = 0; va < KERNBASE; va += PGSIZE){
+      pte = walkpgdir(p->pgdir, (void*)va, 0);
+      if(pte == 0)
+        continue;
+
+      if((*pte & PTE_P) && (*pte & PTE_U) && (*pte & PTE_A)){
+        uint pa = PTE_ADDR(*pte);
+        uint idx = pa >> PGSHIFT;
+
+        // Increase heat (ticket count)
+        core_map[idx].tickets++;
+
+        // Clear access bit for next scan
+        *pte &= ~PTE_A;
+      }
+    }
+  }
+
+  release(&ptable.lock);
+}
 
 // Clear access bit of a random pte.
 void
