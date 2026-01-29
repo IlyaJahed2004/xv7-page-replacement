@@ -9,6 +9,8 @@
 #include "spinlock.h"
 #include "paging.h"
 
+extern void scanner_update_tickets(void);
+
 // Interrupt descriptor table (shared by all CPUs).
 struct gatedesc idt[256];
 extern uint vectors[];  // in vectors.S: array of 256 entry pointers
@@ -55,11 +57,16 @@ trap(struct trapframe *tf)
     if(cpuid() == 0){
       acquire(&tickslock);
       ticks++;
+
+    // ---- Scanner hook (Inverse Lottery Aging) ----
+      scanner_update_tickets();
+
       wakeup(&ticks);
       release(&tickslock);
-    }
+  }
     lapiceoi();
     break;
+
   case T_IRQ0 + IRQ_IDE:
     ideintr();
     lapiceoi();
