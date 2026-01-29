@@ -322,56 +322,89 @@ ii) if (i) is unable to find any such page, randomly reset access bit
     of 10% of the allocated pages and call select_a_victim() again
 */
 
-// Selects a victim page for eviction using the FIFO algorithm.
-// Returns the page table entry (PTE) of the oldest page in memory.
+// Selects a victim page for eviction using the Lottery algorithm.
+// Each physical frame has a number of tickets, and a random draw
+// determines which page will be evicted.
+// Only user pages (PTE_U) are considered.
 pte_t*
 select_a_victim(pde_t *pgdir)
 {
   pde_t *pde;
   pte_t *pte;
   pte_t *victim_pte = 0;
-  
-  // Initialize min_birth_time to the maximum possible integer value.
-  // We are looking for the smallest birth_time (oldest page).
-  uint min_birth_time = 0xFFFFFFFF;
-  int found = 0;
-  int p; // Loop variable
 
-  // Iterate through all Page Directory Entries
+  uint total_tickets = 0;   // Total number of lottery tickets
+  uint chosen_ticket = 0;   // Randomly chosen ticket number
+  uint cumulative = 0;      // Cumulative ticket counter
+
+  int p; // Page directory index
+
+  // ------------------------------------------------------------
+  // First pass: calculate the total number of tickets
+  // ------------------------------------------------------------
   for(p = 0; p < NPDENTRIES; p++){
     pde = &pgdir[p];
-    if(*pde & PTE_P){ // Check if Page Directory is present
+    if(*pde & PTE_P){  // Page directory entry is present
       pte = (pte_t*)P2V(PTE_ADDR(*pde));
 
-      // Iterate through all Page Table Entries in this directory
       for(int i = 0; i < NPTENTRIES; i++){
-        // Check if the page is:
-        // 1. Present (PTE_P)
-        // 2. User accessible (PTE_U) - we don't swap kernel pages
+        // Consider only present user pages
         if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
-          
-          uint pa = PTE_ADDR(pte[i]); // Get physical address
-          uint idx = pa >> PGSHIFT;   // Get frame index
-          
-          // FIFO Comparison:
-          // Check if this page's birth_time is older (smaller) than the current minimum.
-          if(core_map[idx].birth_time < min_birth_time){
-            min_birth_time = core_map[idx].birth_time;
-            victim_pte = &pte[i]; // Update the victim candidate
-            found = 1;
+          uint pa = (uint)PTE_ADDR(pte[i]); // Physical address
+          uint idx = pa >> PGSHIFT;          // Frame index
+
+          // Add this frame's tickets to the total
+          if(core_map[idx].tickets > 0)
+            total_tickets += core_map[idx].tickets;
+        }
+      }
+    }
+  }
+
+  // If no tickets are found, no victim can be selected
+  if(total_tickets == 0)
+    return 0;
+
+  // ------------------------------------------------------------
+  // Choose a random ticket number
+  // ------------------------------------------------------------
+  chosen_ticket = ticks % total_tickets;
+
+  // ------------------------------------------------------------
+  // Second pass: find the page whose ticket wins the lottery
+  // ------------------------------------------------------------
+  for(p = 0; p < NPDENTRIES; p++){
+    pde = &pgdir[p];
+    if(*pde & PTE_P){
+      pte = (pte_t*)P2V(PTE_ADDR(*pde));
+
+      for(int i = 0; i < NPTENTRIES; i++){
+        if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
+          uint pa = (uint)PTE_ADDR(pte[i]);
+          uint idx = pa >> PGSHIFT;
+
+          if(core_map[idx].tickets > 0){
+            cumulative += core_map[idx].tickets;
+
+            // The ticket falls in this page's range
+            if(cumulative > chosen_ticket){
+              victim_pte = &pte[i];
+
+              // Debug output for lottery eviction
+              cprintf("LOTTERY EVICTION: Victim PA 0x%x, tickets %d\n",
+                      pa, core_map[idx].tickets);
+
+              return victim_pte;
+            }
           }
         }
       }
     }
   }
 
-  // Optional: Debug print (can be commented out for production)
-  if(found){
-    cprintf("FIFO EVICTION: Victim PA 0x%x, BirthTime %d\n", PTE_ADDR(*victim_pte), min_birth_time);
-  }
-
-  return victim_pte;
+  return 0;
 }
+
 
 // Clear access bit of a random pte.
 void
