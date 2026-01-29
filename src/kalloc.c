@@ -84,6 +84,8 @@ kfree(char *v)
   core_map[idx].is_allocated = 0; // Mark frame as free
   core_map[idx].birth_time = 0;   // Clear timestamp
   // --- FIFO LOGIC END ---
+  core_map[idx].tickets = 0;      // Lottery: no tickets for free frame
+
 
   // Fill with junk to catch dangling refs.
   memset(v, 1, PGSIZE);
@@ -118,6 +120,8 @@ kalloc(void)
     core_map[idx].is_allocated = 1;       // Mark frame as allocated
     core_map[idx].birth_time = fifo_clock++; // Assign current timestamp and increment clock
     // --- FIFO LOGIC END ---
+    core_map[idx].tickets = 1;   // Lottery: default ticket count
+
   }
   if(kmem.use_lock)
     release(&kmem.lock);
