@@ -8,6 +8,17 @@
 #include "memlayout.h"
 #include "mmu.h"
 #include "spinlock.h"
+#include "coremap.h"
+
+// Calculate the number of frames based on total physical memory size.
+// core_map acts as a parallel array to physical memory frames.
+struct core_map_entry core_map[PHYSTOP >> PGSHIFT];
+
+
+// Global clock tick for the FIFO algorithm.
+// Increments on every page allocation to represent relative time.
+unsigned int fifo_clock = 0;
+
 
 void freerange(void *vstart, void *vend);
 extern char end[]; // first address after kernel loaded from ELF file
@@ -65,9 +76,18 @@ kfree(char *v)
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree in kalloc.c");
 
+  // --- FIFO LOGIC START ---
+  // Reset metadata when a page is freed (returned to the free list).
+  uint pa = V2P(v);             // Convert Kernel Virtual Address to Physical Address
+  uint idx = pa >> PGSHIFT;     // Calculate frame index (Page Frame Number)
+  
+  core_map[idx].is_allocated = 0; // Mark frame as free
+  core_map[idx].birth_time = 0;   // Clear timestamp
+  // --- FIFO LOGIC END ---
+
   // Fill with junk to catch dangling refs.
   memset(v, 1, PGSIZE);
-
+  
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = (struct run*)v;
@@ -88,8 +108,17 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    // --- FIFO LOGIC START ---
+    // Initialize metadata for the newly allocated page.
+    uint pa = V2P((char*)r);      // Get the physical address of the allocated block
+    uint idx = pa >> PGSHIFT;     // Calculate frame index
+    
+    core_map[idx].is_allocated = 1;       // Mark frame as allocated
+    core_map[idx].birth_time = fifo_clock++; // Assign current timestamp and increment clock
+    // --- FIFO LOGIC END ---
+  }
   if(kmem.use_lock)
     release(&kmem.lock);
   return (char*)r;

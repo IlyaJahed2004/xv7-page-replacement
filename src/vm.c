@@ -9,6 +9,9 @@
 #include "paging.h"
 #include "fs.h"
 
+#include "coremap.h"
+
+
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
 
@@ -319,33 +322,55 @@ ii) if (i) is unable to find any such page, randomly reset access bit
     of 10% of the allocated pages and call select_a_victim() again
 */
 
+// Selects a victim page for eviction using the FIFO algorithm.
+// Returns the page table entry (PTE) of the oldest page in memory.
 pte_t*
 select_a_victim(pde_t *pgdir)
 {
+  pde_t *pde;
   pte_t *pte;
-  for(long i=4096; i<KERNBASE;i+=PGSIZE){    //for all pages in the user virtual space
-  //  cprintf("i wala loop\t");
-    if((pte=walkpgdir(pgdir,(char*)i,0))!= 0) //if mapping exists (0 as 3rd argument as we dont want to create mapping if does not exists)
-		  {    // cprintf("walkpgdir successful\t");
+  pte_t *victim_pte = 0;
+  
+  // Initialize min_birth_time to the maximum possible integer value.
+  // We are looking for the smallest birth_time (oldest page).
+  uint min_birth_time = 0xFFFFFFFF;
+  int found = 0;
+  int p; // Loop variable
 
-           if(*pte & PTE_P) //if not dirty, or (present and access bit not set)  --- conditions needs to be checked
-           {   if(*pte & ~PTE_A)             //access bit is NOT set.
-               {
-                  // cprintf("409600\n");
-                //*pte = *pte | PTE_A;
-                 // cprintf("returning victim\n");
-                 return pte;
-               }
-           }
+  // Iterate through all Page Directory Entries
+  for(p = 0; p < NPDENTRIES; p++){
+    pde = &pgdir[p];
+    if(*pde & PTE_P){ // Check if Page Directory is present
+      pte = (pte_t*)P2V(PTE_ADDR(*pde));
+
+      // Iterate through all Page Table Entries in this directory
+      for(int i = 0; i < NPTENTRIES; i++){
+        // Check if the page is:
+        // 1. Present (PTE_P)
+        // 2. User accessible (PTE_U) - we don't swap kernel pages
+        if((pte[i] & PTE_P) && (pte[i] & PTE_U)){
+          
+          uint pa = PTE_ADDR(pte[i]); // Get physical address
+          uint idx = pa >> PGSHIFT;   // Get frame index
+          
+          // FIFO Comparison:
+          // Check if this page's birth_time is older (smaller) than the current minimum.
+          if(core_map[idx].birth_time < min_birth_time){
+            min_birth_time = core_map[idx].birth_time;
+            victim_pte = &pte[i]; // Update the victim candidate
+            found = 1;
+          }
+        }
       }
-      else{
+    }
+  }
 
-        cprintf("walkpgdir failed \n ");
-      }
-	}
+  // Optional: Debug print (can be commented out for production)
+  if(found){
+    cprintf("FIFO EVICTION: Victim PA 0x%x, BirthTime %d\n", PTE_ADDR(*victim_pte), min_birth_time);
+  }
 
-  cprintf("bahar aa gaya  ");
-  return 0;
+  return victim_pte;
 }
 
 // Clear access bit of a random pte.

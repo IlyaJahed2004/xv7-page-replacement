@@ -92,3 +92,91 @@ We will implement a probabilistic **Lottery-Based Replacement** policy.
 
 
 ---
+
+
+## Phase 1: Architecture Analysis & FIFO Logic
+
+Before diving into the implementation of the First-In-First-Out (FIFO) eviction policy, we analyzed how xv7 manages physical memory and how the kernel views addresses. This understanding is critical for correctly implementing the `core_map` logic.
+
+### 1. The `core_map`: A Physical Memory Ledger
+The `core_map` acts as the "Property Deed" registry for the RAM. 
+*   **The Concept:** At the Physical Memory Manager level, the kernel focuses on the **container** (the frame) rather than the content.
+*   **The Structure:** We utilize an array where every index corresponds directly to a physical frame number (PFN).
+    *   `core_map[0]` $\rightarrow$ Physical Frame 0
+    *   `core_map[i]` $\rightarrow$ Physical Frame `i`
+*   **The Metadata:** For every frame, we track:
+    1.  `is_allocated`: Is this frame currently in use?
+    2.  `birth_time`: When was this frame allocated? (Crucial for FIFO).
+
+### 2. The `kalloc` Workflow
+A common misconception is that `kalloc` translates addresses. In reality, `kalloc` is a **distributor**.
+
+1.  **The Source:** `kalloc` pulls a free page from `kmem.freelist`. These pages are already mapped into the Kernel's Virtual Address space.
+2.  **The Return Value:** It returns a **Virtual Address** pointer (e.g., `0x80200000`). This is necessary because the CPU (and the kernel code running on it) always sees memory through the MMU.
+3.  **The Challenge:** To update our `core_map` (which tracks physical frames), we need the **Physical Address**, not the virtual one returned by `kalloc`.
+
+### 3. Deep Dive: Kernel Virtual vs. Physical Addresses
+The xv7 kernel uses a "Direct Mapping" strategy for physical memory.
+
+*   **The "MMU Goggles":** The CPU never sees raw physical memory. It views memory through a virtual mapping.
+*   **The Offset:** The kernel maps all available physical RAM to a high virtual address range starting at `KERNBASE` (usually `0x80000000` or 2GB).
+
+**The Translation Formula:**
+> Physical Address = Kernel Virtual Address - KERNBASE
+
+### Visualizing the Allocation Flow
+When `kalloc()` is called to allocate a new page, the following translation occurs to update the ledger:
+```text
+Step 1: kalloc retrieves a free page pointer (Virtual Address)
+Pointer 'r' = 0x80001000  (Kernel Space)
+
+Step 2: We need the Physical Index for core_map
+We apply V2P (Virtual to Physical macro):
+0x80001000 - 0x80000000 (KERNBASE) = 0x00001000 (Physical Addr)
+
+Step 3: Calculate Index
+Physical Addr 0x1000 / PageSize (4096) = Index 1
+
+Step 4: Update Ledger
+core_map[1].birth_time = current_clock;
+core_map[1].is_allocated = 1;
+
+Step 5: Return Virtual Pointer
+The function returns 'r' (0x80001000) so the kernel can write to it.
+```
+
+### 4. The Eviction Strategy (FIFO)
+When memory is full (`select_a_victim` in `vm.c`), we perform a linear scan of the page tables (virtual space):
+1.  We look at a candidate page (PTE).
+2.  We extract the physical address from the PTE.
+3.  We check the `core_map` using that physical address to retrieve its `birth_time`.
+4.  We compare it against the oldest `birth_time` found so far.
+5.  The page with the smallest (earliest) timestamp is selected for eviction.
+
+
+In this phase, we replaced the default circular replacement policy with a **First-In, First-Out (FIFO)** algorithm. The goal ensures that the page which has been in the physical memory the longest is the first one to be evicted when a swap is necessary.
+
+### 1. Data Structures (`coremap.h`)
+We introduced a `core_map` structure to store metadata for every physical page frame.
+```c
+struct core_map_entry {
+  int is_allocated;        // Tracks if the frame is in use
+  unsigned int birth_time; // Timestamp of when the page was loaded (FIFO)
+};
+```
+
+### 2. Time Tracking (`kalloc.c`)
+To determine the "age" of a page, we implemented a global clock:
+-   **`fifo_clock`**: A global counter that increments every time a physical page is allocated.
+-   **Allocation Hook (`kalloc`)**: When a page is allocated, we record the current `fifo_clock` into `core_map[frame_index].birth_time`.
+-   **Free Hook (`kfree`)**: When a page is freed, we reset its metadata in the `core_map`.
+
+### 3. Eviction Logic (`vm.c`)
+The `select_a_victim()` function was rewritten to scan the page table. Instead of stopping at the first non-accessed page, it now:
+1.  Iterates through all present user pages (`PTE_P` and `PTE_U`).
+2.  Looks up the `birth_time` of the corresponding physical frame in the `core_map`.
+3.  Selects the page with the **minimum** `birth_time` (the oldest page) as the victim for eviction.
+
+This establishes the infrastructure required for the Lottery algorithm, where `birth_time` will eventually be replaced or augmented by `tickets`.
+
+---
