@@ -9,6 +9,7 @@
 struct core_map_entry {
   int is_allocated;        // Flag: 1 if the frame is currently in use, 0 otherwise
   unsigned int birth_time; // Timestamp: Records when the page was allocated (for FIFO)
+  uint tickets;   // Lottery ticket count
 };
 
 // Global array declaration.
