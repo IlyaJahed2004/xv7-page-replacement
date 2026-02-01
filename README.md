@@ -180,3 +180,108 @@ The `select_a_victim()` function was rewritten to scan the page table. Instead o
 This establishes the infrastructure required for the Lottery algorithm, where `birth_time` will eventually be replaced or augmented by `tickets`.
 
 ---
+
+## Phase 2: Inverse Lottery Page Replacement
+
+In this phase, the FIFO-based eviction mechanism was extended into a **Lottery-based page replacement policy**, following the project specification.  
+The goal of this phase was to replace the deterministic eviction decision with a **probabilistic victim selection strategy**, while preserving the correctness and stability of the swapping subsystem.
+
+---
+
+## From FIFO to Lottery: Conceptual Transition
+
+The FIFO implementation introduced in Phase 1 established a crucial infrastructure:
+
+- A global `core_map` indexed by physical frame number
+- Per-frame metadata stored independently of page tables
+- A centralized eviction point (`select_a_victim()`)
+
+Phase 2 builds **directly on top of this infrastructure**.
+
+Instead of deterministically evicting the oldest page, the system now assigns **tickets** to pages and selects a victim using an **inverse lottery** mechanism.
+
+---
+
+## The Inverse Lottery Model
+
+### Why Inverse Lottery?
+In classical Lottery Scheduling, entities with **more tickets** are favored.  
+For page replacement, this logic is inverted:
+
+- Pages with **fewer tickets** are **more likely to be evicted**
+- Pages with more tickets are statistically protected from eviction
+
+This allows the kernel to:
+- Avoid rigid eviction patterns
+- Reduce starvation and pathological cases
+- Gracefully degrade to FIFO behavior when all tickets are equal
+
+---
+
+## Ticket Assignment Strategy
+
+Each physical page frame participates in the lottery using metadata stored in `core_map`.
+
+Conceptually:
+- Every allocated frame owns a ticket weight
+- The total ticket sum is computed across all eligible pages
+- A random number is drawn
+- Pages are scanned until the cumulative ticket count reaches the random value
+
+The corresponding page is selected as the **victim**.
+
+When all pages have identical ticket values, the selection probability becomes uniform, and the algorithm naturally degenerates into FIFO-like behavior.
+
+---
+
+## Eviction Logic (`vm.c`)
+
+The `select_a_victim()` function was extended beyond FIFO logic:
+
+1. All valid user pages (`PTE_P | PTE_U`) are scanned.
+2. For each page:
+   - The physical frame index is extracted from the PTE.
+   - The corresponding `core_map` entry is accessed.
+3. Instead of choosing the minimum `birth_time`, pages participate in a weighted lottery.
+4. A victim is probabilistically selected and returned for swap-out.
+
+The eviction pipeline (swap-out, page table update, frame reuse) remains unchanged, ensuring minimal disruption to the existing VM flow.
+
+---
+
+## Interaction with the Physical Memory Allocator
+
+The lottery mechanism relies on correct bookkeeping at allocation time:
+
+- **`kalloc()`**
+  - Marks frames as allocated in `core_map`
+  - Initializes metadata required for eviction participation
+- **`kfree()`**
+  - Clears metadata upon frame release
+  - Ensures freed frames do not participate in future lotteries
+
+This tight coupling guarantees that only valid resident pages are eligible for eviction.
+
+---
+
+## Validation & Results
+
+The implementation was tested under heavy memory pressure using:
+
+- `memtest1`
+- `memtest2`
+
+Observed behavior:
+- Continuous page allocation beyond physical memory limits
+- Frequent swap-in / swap-out activity
+- Correct victim selection without kernel panics or deadlocks
+- Successful completion of all tests (`mem ok`)
+
+The runtime logs confirm that victim selection occurs consistently, often resolving in the first lottery attempt, indicating stable convergence of the algorithm.
+
+---
+
+## Summary
+
+Phase 2 completes the transition from a deterministic FIFO policy to a probabilistic **Inverse Lottery Page Replacement** algorithm.  
+The solution integrates cleanly with the existing xv7 virtual memory subsystem and satisfies the project requirements without altering the external kernel interface.
